@@ -1,113 +1,110 @@
-# Julia SMC and particle-filter landscape vs `smc-jax`
+# Julia SMC landscape vs `smc-jax`
 
-This note maps the Julia SMC ecosystem onto what `smc-jax/` does for Model A.
-Same model, same synthetic data, same target parameters.
-The point is to see how close stock Julia tooling gets you and what is still missing.
+What is in `julia-smc/` is three SMC-flavoured fits of Model A on the same synthetic dataset, built using the Julia SMC ecosystem (GeneralisedFilters.jl, AdvancedPS / Turing, hand-rolled SMC sampler).
+The point is to see what stock Julia tooling gives you and where you still have to write code if you want what `smc-jax` does.
 
-## What is in `julia-smc/`
+The first round of this comparison used Turing + NUTS over the joint posterior of (theta, latent innovations).
+That works fine and is already a known approach in Julia, so it is dropped here in favour of three actual SMC variants.
 
-- `src/ModelA.jl` — a Julia port of the Model A spec from `smc-jax/`.
-  Forward simulator that matches `smc-jax/src/smc_renewal/synthetic.py::simulate` step-for-step.
-  Turing `@model` for the same generative process written non-centred over the 4 standard-normal innovation series (`eps_R`, `eta_R`, `eps_F`, `eta_F`) and the static parameters `(log_tau_R, log_tau_F, log_phi)`.
-- `scripts/01_synthetic_demo.jl` — equivalent of `examples/01_synthetic_demo.py`.
-- `scripts/02_fit.jl` — equivalent of `examples/02_pf_fit.py`, but using off-the-shelf NUTS instead of a Liu-West PF.
+## Three variants in this directory
 
-It sits in its own subdirectory with its own `Project.toml` so the env does not clash with the existing top-level Julia project that pins `Mooncake`/`Enzyme` for the GI examples.
+| Variant | Outer (theta) | Inner (latent path) | What gives you the marginal log-lik for theta? |
+| --- | --- | --- | --- |
+| `pmmh/` | Metropolis-Hastings (manual, AdvancedMH-style) | Bootstrap PF, GeneralisedFilters.jl `BF` | PF marginal log-lik (noisy, unbiased) |
+| `smc2/` | SMC sampler with adaptive tempering (hand-rolled, ~150 LOC) | Bootstrap PF, GeneralisedFilters.jl `BF` | same PF marginal, called per theta-particle |
+| `pgas_nuts/` | NUTS (Turing) | Particle Gibbs (Turing/AdvancedPS bootstrap PF) | Gibbs(PG, NUTS) alternates updates rather than computing an explicit marginal |
 
-## Julia inference packages relevant to this model
+All three share `src/ModelA.jl`, which now exposes the model in two forms.
+`step_state` and `simulate` remain the pure dynamics + forward simulator.
+On top of that, `ModelAParams`, `ModelAPrior`, `ModelADynamics`, `ModelAObservation`, and `build_ssm` wrap the model in the `SSMProblems.jl` interface so the same dynamics feed straight into GeneralisedFilters.
 
-| Package | What it offers |
-|---|---|
-| `Turing.jl` | PPL with NUTS, HMC, MH, IS, Gibbs, plus particle-Gibbs samplers (`PG`, `SMC`, `PGAS`). The standard front door for Bayesian inference on a user-written generative model. |
-| `AdvancedPS.jl` | Particle MCMC building blocks under Turing — bootstrap PF, particle-Gibbs, PG-AS, conditional SMC. Turing's `SMC`, `PG`, `PGAS` samplers dispatch through it. |
-| `ParticleFilters.jl` | Standalone PF library oriented at POMDPs.jl (robotics / control). Bootstrap PF and basic SIR resampling. No PMCMC and no parameter cloud. |
-| `SequentialMonteCarlo.jl` | Pure SMC sampler with adaptive tempering, lookahead, and dispatch to multiple resampling schemes. POMDP-flavoured rather than state-space-with-static-theta. |
-| `LowLevelParticleFilters.jl` | Engineering-flavoured Kalman / UKF / particle filters with offline-smoothing utilities. Bootstrap PF; no Liu-West, no PMCMC. |
-| `StateSpaceInference.jl`, `GeneralisedFilters.jl` | Smaller experimental SSM packages with Kalman / UKF / PF building blocks. Not at a maturity to substitute for the smc-jax PF on this model. |
-| `Stheno.jl`, `GaussianProcesses.jl` | Not directly relevant but listed because the model has nested-RW (= GP-like) latent structure. |
+## Julia inference packages used or considered
 
-## What was used and why
+| Package | What it offers | Used here? |
+| --- | --- | --- |
+| `Turing.jl` | PPL with NUTS, HMC, MH, IS, Gibbs, and particle-Gibbs (`PG`, `SMC`, `PGAS`) | Yes — pgas_nuts variant uses Turing's `Gibbs(PG, NUTS)` |
+| `AdvancedPS.jl` | Particle MCMC primitives — bootstrap PF, particle-Gibbs, PG-AS, conditional SMC. Backs Turing's particle samplers | Indirectly, via Turing's `PG` |
+| `GeneralisedFilters.jl` | Kalman filter (linear-Gaussian only), bootstrap and auxiliary particle filters, RBPF; SSMProblems.jl interface | Yes — `BF` used as the inner marginal for both PMMH and the SMC sampler |
+| `SSMProblems.jl` | Common interface (StatePrior / LatentDynamics / ObservationProcess / StateSpaceModel) for SSM definitions | Yes — Model A wrapped as an SSM in `src/ModelA.jl` |
+| `AdvancedMH.jl` | Metropolis-Hastings building blocks for AbstractMCMC | Conceptually — the manual PMMH loop in `pmmh/run.jl` is an MH walk written by hand. Could be swapped for `AdvancedMH.MetropolisHastings` with a LogDensityProblems wrapper. |
+| `LowLevelParticleFilters.jl` | Standalone PF / KF / EKF / UKF / RBPF library, more engineering-oriented | No — installed in the env but not used; UKF would have been an option for variant 1 (UKF + NUTS-on-theta) but blocked by the Gaussian-filter blind spot on `(log_tau_R, log_tau_F)` documented in `smc-jax/README.md` |
+| `SequentialMonteCarlo.jl` | Pure SMC sampler with adaptive tempering, several resamplers | Not used — the SMC sampler in `smc2/run.jl` is hand-rolled at ~150 LOC because wiring this package to a PF marginal needs the same amount of glue |
 
-NUTS through Turing, with `AutoReverseDiff(compile=false)` for AD.
+## What the three variants recover
 
-Reasoning:
+Same synthetic dataset throughout: `T = 120`, `MersenneTwister(2)`, truth `(log_tau_R = -4.0, log_tau_F = -12.0, log_phi = 2.5)`.
 
-- Model A as written is a continuous joint density over `(log_tau_R, log_tau_F, log_phi)` plus an initial-state vector plus 4 standard-normal innovation series of length T.
-  Non-centred parameterisation makes the gradient well-defined everywhere and NUTS handles it directly.
-- The point of the exercise is "off-the-shelf".
-  NUTS is what Turing gives you for free for a continuous joint problem.
-  No custom kernels, no Liu-West, no extension code.
-- The particle samplers in Turing (`SMC`, `PG`, `PGAS`) target latent-state models with a small static-parameter Gibbs sweep, but the static parameters `(log_tau_R, log_tau_F, log_phi)` and the 4 long standard-normal innovation series get mixed through the same posterior.
-  PG would only update the latent path inside SMC; static `tau` parameters need a separate kernel (MH/HMC) inside Gibbs.
-  This stops being "off the shelf" the moment you write that wrapper.
-  In practice the long latent path also degenerates PG on this scale (T ≈ 120, ~480 latent innovations), so the gain over NUTS is not obvious.
-- `LowLevelParticleFilters.jl` and `ParticleFilters.jl` ship a bootstrap PF and resampling but assume a known dynamics object with static parameters — no built-in cloud over `(log_tau_R, log_tau_F, log_phi)` and no Liu-West jittering.
+| Variant | log_tau_R (truth -4.0) | log_tau_F (truth -12.0) | log_phi (truth 2.5) | Notes |
+| --- | --- | --- | --- | --- |
+| `pmmh/` | -4.073 ± 0.301 | -12.042 ± 0.419 | 2.477 ± 0.143 | 1500 iter, 1500 PF particles, accept 0.589 |
+| `smc2/` | -4.099 ± 0.304 | -12.117 ± 0.507 | 2.514 ± 0.148 | 128 theta-particles, 600 PF particles, 4 adaptive-tempering steps |
+| `pgas_nuts/` | -3.998 ± 0.237 | -11.582 ± 0.374 | 2.466 ± 0.151 | 600 iter (150 NUTS adapts), 200 PF particles per PG sweep |
 
-Result on the synthetic data with `T = 120`, NUTS warmup 300 + 300 samples, `InitFromPrior()` (reproducible with `MersenneTwister(11)` in `scripts/02_fit.jl`):
+All three variants recover the parameters to within ~3% of truth on this synthetic data, comparable to what `smc-jax`'s Liu-West PF reports for the same parameters in its README.
+`pgas_nuts` shows slightly larger bias on `log_tau_F` (~3.5%), consistent with the known PG mixing penalty on long continuous latent paths.
 
-- `log_tau_R` = -4.024 ± 0.267 (truth -4.0)
-- `log_tau_F` = -11.982 ± 0.561 (truth -12.0)
-- `log_phi`   =  2.516 ± 0.129 (truth +2.5)
+## What `smc-jax` does that stock Julia does not give you for free
 
-All three within ~1.5% of truth, comparable to the `~5%` recovery the JAX Liu-West PF reports for the same parameters in `smc-jax/README.md`.
-The smoothed log_Rt(t) posterior band achieves 89.2% empirical coverage of the truth trajectory (nominal 90%).
+The point of this comparison is to be specific about which features of `smc-jax/pf/`, `smc-jax/smc2/`, and `smc-jax/rolling_origin.py` have no direct stock-Julia counterpart, and so would need code if you wanted them.
 
-Initialisation matters: `InitFromUniform()` (the Turing default) starts at log_F values that make the feedback term blow up the gradient on the first step and adapts the step size to ~1e-8.
-`InitFromPrior()` starts in a well-conditioned region and adapts to a sensible step.
-
-## What `smc-jax` does that no off-the-shelf Julia package gives you for free
-
-These are the specific features in `smc-jax/pf/`, `smc-jax/smc2/`, `smc-jax/rolling_origin.py` that have no direct Julia counterpart you can pull in without writing the kernel yourself.
-
-1. **Liu-West shrink-jitter on static parameters.**
-   `smc-jax` carries `(log_tau_R, log_tau_F, log_phi)` as a per-particle parameter cloud and at each resample applies the Liu-West shrink (`mean + h * (theta_i - mean)`) plus a jitter of variance `(1 - h^2) * cov(theta)` to keep the marginal posterior moving without losing diversity.
-   `AdvancedPS.jl` and `Turing.jl`'s `PG` / `SMC` / `PGAS` samplers do not provide this kernel.
-   You can write it as a Gibbs step inside Turing, but at that point it is not off-the-shelf.
+1. **Liu-West shrink-jitter on static parameters in a single forward pass.**
+   `smc-jax`'s Liu-West PF carries `(log_tau_R, log_tau_F, log_phi)` as a per-particle parameter cloud and shrink-jitters them inside the same sweep that filters the latent path.
+   AdvancedPS / GeneralisedFilters have no shrink-jitter kernel.
+   The closest Julia analogue is the SMC sampler in `smc2/`, which carries a parameter cloud but does explicit MH moves between tempering steps rather than continuous shrink-jitter.
 
 2. **Steyn-style fixed-lag resampling.**
-   `smc-jax/pf/runner.py`'s `fixed_lag_L` argument restricts the resample permutation to the last `L` steps of state and parameter history, motivated by the observation that data at time `t` are only informative about latent states a few days back due to the reporting delay.
-   None of the Julia PF packages implement this; they either resample the cloud only (current step) or assume offline smoothing.
+   `smc-jax/pf/runner.py`'s `fixed_lag_L` argument restricts the resample permutation to the last L steps of state and parameter history.
+   No Julia PF package implements this; they resample the current step only or expose offline smoothing.
 
-3. **SMC² with a pluggable Gaussian inner filter (UKF, library EKF).**
-   `smc-jax/smc2/` is an adaptive-tempered SMC² over `theta` whose inner marginal-likelihood is supplied by a UKF (`smc2.ukf`) or an EKF (`smc2.ekf_cuthbert`).
-   Julia has Kalman / UKF (e.g. `LowLevelParticleFilters.jl`, `KalmanFilters.jl`) and you can write SMC² on top of `SequentialMonteCarlo.jl`, but the wiring is not provided by any single package.
+3. **SMC² with a pluggable Gaussian inner filter (UKF or EKF).**
+   `smc-jax/smc2/` lets the inner marginal-likelihood come from a UKF (`smc2.ukf`) or a library EKF (`smc2.ekf_cuthbert`).
+   The Julia counterpart in `smc2/` here uses a PF inner instead because GeneralisedFilters v0.4.2 has no UKF/EKF (only the linear-Gaussian KF and PF variants).
+   LowLevelParticleFilters.jl has a UKF but pairing it with an SMC sampler is glue you write yourself.
 
 4. **Guided / auxiliary-q proposals (Model E territory).**
    The Rao-Blackwellised auxiliary-q Wallenius proposal for the GDM cohort-partition observation in `smc-jax/pf/observation_gdm.py` is custom-written.
    No Julia package supplies it.
-   Out of scope here because we are doing Model A only, but it is the biggest gap if the modelling moves to contact-tracing depletion / GDM observation.
+   Out of scope here (we are doing Model A) but the biggest gap if the modelling moves to contact-tracing depletion + GDM.
 
 5. **Sequential extension (`extend_liu_west`, `rolling_origin_forecast`).**
    `smc-jax` carries the trailing particle cloud across data arrivals and updates rather than refits.
-   Turing has no first-class sequential-update API.
-   `AdvancedPS.jl` exposes particle containers but there is no `extend` operator that handles the parameter cloud as well as the latent path.
+   None of the Julia samplers here have a first-class `extend` operator that handles the parameter cloud and the latent path together.
+   You would write the outer loop yourself.
 
-6. **Trajectory smoothing with genealogy tracing in a typed result.**
+6. **Trajectory smoothing with genealogy tracing returned in a typed result.**
    `pfjax.particle_smooth` gives backward-traced sample paths from the surviving genealogy.
-   Julia PF packages give offline RTS / two-filter smoothers for Kalman variants but no genealogy-tracing trajectory smoother for a bootstrap PF with a parameter cloud.
+   GeneralisedFilters has callbacks that capture the genealogy (`AncestorCallback`) and a `get_ancestry` helper that lets you reconstruct paths after the fact — usable, but a thinner surface than what `smc-jax` builds on.
 
-In short: stock Turing / NUTS gets you the *posterior* on Model A on synthetic data to the same accuracy as the Liu-West PF in `smc-jax`.
-What it does not give you is the *online* operation — the sequential update, the Liu-West cloud, fixed-lag resampling, SMC² over `theta`, and the guided proposals you need for Model E.
-Those would each be a custom kernel inside a Turing Gibbs scheme or a custom loop on `AdvancedPS.jl` primitives.
+## The Gaussian-filter blind spot, and why it shapes variant choice
 
-## Why NUTS rather than PG on this model
+`smc-jax/README.md` documents that the SMC² + EKF / UKF path is essentially blind to `(log_tau_R, log_tau_F)`.
+The Gaussian-filter linearisation collapses the chain `tau -> variance of log sigma -> sigma via exp`, so the marginal log-lik moves with `log_phi` but barely with the tau parameters.
 
-PG / SMC in Turing handles models with a clean latent-state structure and a small static-parameter block updated by an outer Gibbs.
-Model A here is naturally written with the latent path as one big block of innovations.
-Particle Gibbs on T ≈ 120 steps with continuous latent state would degenerate via the standard ancestor-resampling path collapse, and the static-parameter updates would still need a non-PG kernel.
-NUTS on the non-centred parameterisation sidesteps both problems: the innovations are unit normal a priori, the static parameters are continuous, and the gradient through `step_state` is well-defined.
+That blind spot is **structural**, not specific to Python.
+A Julia UKF inner SMC² (e.g. LowLevelParticleFilters UKF + a hand-rolled SMC over theta) would land on the same problem.
+The fix is to keep the inner exact, which means a particle filter — bootstrap or guided.
+That is why both `pmmh/` and `smc2/` here use a PF inner, and why a UKF-inner-with-NUTS-on-theta variant was not pursued.
 
-Trying PG honestly here would mean writing the kernel that PG does not give you for free, which contradicts the brief.
-The honest description is: Turing's `PG`/`SMC`/`PGAS` did not cover Model A as-written without that custom kernel, so we used NUTS, which did.
+## A note on the pgas_nuts variant
+
+The cleanest off-the-shelf "SMC for latents + NUTS for statics" Julia path is the unreleased GeneralisedFilters v0.5 sampler:
+```julia
+sampler = ParticleGibbs(ConditionalSMC(BF(n_particles), AncestorSampling()), NUTS(0.8))
+```
+This combo is in main but not in any released version yet.
+With the released v0.4.2 we use Turing's `Gibbs((statics) => NUTS, (latents) => PG)` instead, which is the same composition pattern via AdvancedPS-backed PG.
+That requires indexed latent variables (`eps_R[t] ~ Normal()`) inside the model loop so each step gets its own VarName.
 
 ## Reproducing
 
 ```bash
 cd julia-smc
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
 julia --project=. scripts/01_synthetic_demo.jl
-julia --project=. scripts/02_fit.jl
+julia --project=. pmmh/run.jl
+julia --project=. smc2/run.jl
+julia --project=. pgas_nuts/run.jl
 ```
 
-The fit script takes a few minutes on the default `T = 120` setting.
-The synthetic demo is fast.
+PMMH takes ~10 min, the SMC sampler ~3 min (the adaptive schedule chose only 4 steps on this dataset), and Gibbs(PG, NUTS) the longest of the three.

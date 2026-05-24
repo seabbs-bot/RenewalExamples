@@ -13,13 +13,20 @@ using MCMCChains
 
 # Variant: SMC for the latent path (via Turing's Particle Gibbs, which uses
 # AdvancedPS bootstrap-PF primitives under the hood), NUTS for the static
-# parameters. This is the canonical "off-the-shelf SMC + NUTS for statics"
-# Julia pipeline.
+# parameters. The canonical "off-the-shelf SMC + NUTS for statics" Julia
+# pipeline that works with the renewal dynamics today.
 #
-# The released GeneralisedFilters v0.4.2 does not yet expose its
-# `ParticleGibbs(ConditionalSMC, NUTS)` sampler (that lives on the main
-# branch slated for v0.5). Turing's built-in Gibbs(PG, NUTS) gives the
-# same composition pattern today.
+# Why this path and not GenFilters v0.5 `ParticleGibbs(ConditionalSMC, NUTS)`:
+# the GF v0.5 CSMC sampler calls `SSMProblems.distribution(dyn, step, state)`
+# — a transition density. Model A's state-to-state map is deterministic in
+# 14 of 18 state components (the I_buf shifts deterministically; only the
+# four innovations are stochastic), so the transition density is singular on
+# a 4-D manifold in 18-D state space. `src/ModelA.jl` documents the failed
+# attempt and keeps the flat-vector wrappers around for bootstrap-filter use.
+#
+# The inner dynamics call here reuses `ModelA.step_state` so the renewal
+# step is defined exactly once in the codebase, shared with `pmmh/run.jl`
+# and `smc2/run.jl`.
 
 @model function gibbs_modelA(y, cfg, ::Type{ET} = Float64) where {ET}
     log_tau_R ~ Normal(cfg.prior_log_tau_R_mean, cfg.prior_log_tau_R_sd)
@@ -38,43 +45,22 @@ using MCMCChains
     d_pad = ModelA._pad_pmf(cfg.delay_pmf, L)
 
     phi = exp(log_phi)
-    tau_R = max(exp(log_tau_R), cfg.sigma_floor)
-    tau_F = max(exp(log_tau_F), cfg.sigma_floor)
+    state = (log_Rt = log_Rt0, log_sigma_R = log_sigma_R0,
+             log_F = log_F0, log_sigma_F = log_sigma_F0,
+             log_I0 = log_I0, I_buf = fill(exp(log_I0), L))
 
-    log_Rt = log_Rt0
-    log_sigma_R = log_sigma_R0
-    log_F = log_F0
-    log_sigma_F = log_sigma_F0
-    I_buf = fill(exp(log_I0), L)
-
-    eps_R = Vector{ET}(undef, T)
-    eta_R = Vector{ET}(undef, T)
-    eps_F = Vector{ET}(undef, T)
-    eta_F = Vector{ET}(undef, T)
+    eps_R = Vector{ET}(undef, T); eta_R = Vector{ET}(undef, T)
+    eps_F = Vector{ET}(undef, T); eta_F = Vector{ET}(undef, T)
 
     for t in 1:T
         eps_R[t] ~ Normal()
         eta_R[t] ~ Normal()
         eps_F[t] ~ Normal()
         eta_F[t] ~ Normal()
-
-        sigma_R = max(exp(log_sigma_R), cfg.sigma_floor)
-        sigma_F = max(exp(log_sigma_F), cfg.sigma_floor)
-
-        log_Rt      = log_Rt      + sigma_R * eps_R[t]
-        log_F       = log_F       + sigma_F * eps_F[t]
-        log_sigma_R = log_sigma_R + tau_R   * eta_R[t]
-        log_sigma_F = log_sigma_F + tau_F   * eta_F[t]
-
-        g_conv_I = dot(g_pad, I_buf)
-        F_new = exp(log_F)
-        log_Rt_clipped = clamp(log_Rt, -20.0, 20.0)
-        exponent = clamp(log_Rt_clipped - F_new * g_conv_I, -20.0, 20.0)
-        Rt_eff = exp(exponent)
-        I_new = min(Rt_eff * g_conv_I, 1e15)
-        I_buf = vcat(I_new, I_buf[1:end-1])
-
-        mu_t = dot(d_pad, I_buf)
+        noise = (eps_R = eps_R[t], eta_R = eta_R[t],
+                 eps_F = eps_F[t], eta_F = eta_F[t])
+        state = step_state(state, log_tau_R, log_tau_F, noise, cfg, g_pad)
+        mu_t = expected_observation(state.I_buf, cfg, d_pad)
         y[t] ~ negbin2(mu_t, phi)
     end
 end

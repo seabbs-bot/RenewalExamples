@@ -2,6 +2,7 @@ module ModelA
 
 using Distributions
 using GeneralisedFilters
+import LinearAlgebra
 using LinearAlgebra: I, dot
 using LogExpFunctions: logaddexp, logsumexp
 using Random
@@ -14,7 +15,9 @@ const GF = GeneralisedFilters
 export ModelConfig, default_config, discretised_gamma,
        SyntheticDataset, simulate, step_state, sample_initial_state,
        expected_observation, negbin2, buffer_len,
-       ModelAParams, build_ssm, pf_marginal_loglik
+       ModelAParams, build_ssm, pf_marginal_loglik,
+       ModelAParamsFull, ModelAPriorFlat, ModelADynamicsFlat,
+       ModelAObservationFlat, build_ssm_flat
 
 Base.@kwdef struct ModelConfig
     generation_interval::Vector{Float64}
@@ -240,6 +243,138 @@ function pf_marginal_loglik(rng::AbstractRNG, cfg::ModelConfig,
     model = build_ssm(cfg, params)
     _, ll = GF.filter(rng, model, GF.BF(n_particles), y)
     return ll
+end
+
+# --- Flat-vector SSM for GeneralisedFilters v0.5 PGAS (partial) ---
+#
+# `SSMTrajectory` and the v0.5 ConditionalSMC sampler expect a flat-vector
+# state and a `Distribution`-valued initial prior. The existing NamedTuple
+# state cannot express a `Distribution` directly because `I_buf` is
+# deterministic in `log_I0`. We lift `log_I0` into a parameter rather than
+# a state, treat `I_buf` as near-Dirac at `exp(log_I0)` in the initial
+# prior (variance 1e-16 keeps PF maths well-defined while keeping the
+# initial buffer ~exactly at `exp(log_I0)`), and represent the state as
+# a length `4 + L` vector with layout
+# `[log_Rt, log_sigma_R, log_F, log_sigma_F; I_buf...]`.
+#
+# This is enough for a bootstrap filter (only `simulate` needed). It is
+# NOT enough for v0.5 `ConditionalSMC`, which also calls
+# `SSMProblems.distribution(dyn, step, state)` — a transition density.
+# Model A's transition is deterministic in 14 of 18 state components
+# (`I_buf` shifts deterministically; only the four innovations are
+# stochastic), so the transition density is singular on a 4-D manifold
+# in 18-D state space. A workable `distribution` would be a singular
+# Gaussian and the IS weights for CSMC are then ill-defined in the usual
+# sense.
+#
+# The wrappers below are kept for completeness — they let you run a
+# bootstrap filter via `build_ssm_flat`. They do NOT make PGAS via
+# `ParticleGibbs(ConditionalSMC, NUTS)` work on Model A as-is.
+
+struct ModelAParamsFull
+    log_tau_R::Float64
+    log_tau_F::Float64
+    log_phi::Float64
+    log_I0::Float64
+end
+
+struct ModelAPriorFlat <: StatePrior
+    cfg::ModelConfig
+    log_I0::Float64
+end
+
+function SSMProblems.distribution(prior::ModelAPriorFlat; kwargs...)
+    cfg = prior.cfg
+    L = buffer_len(cfg)
+    I0 = exp(prior.log_I0)
+    means = vcat(
+        [cfg.init_log_Rt_mean, cfg.init_log_sigma_R_mean,
+         cfg.init_log_F_mean,  cfg.init_log_sigma_F_mean],
+        fill(I0, L),
+    )
+    vars = vcat(
+        [cfg.init_log_Rt_sd^2, cfg.init_log_sigma_R_sd^2,
+         cfg.init_log_F_sd^2,  cfg.init_log_sigma_F_sd^2],
+        fill(1e-16, L),
+    )
+    return MvNormal(means, LinearAlgebra.Diagonal(vars))
+end
+
+struct ModelADynamicsFlat{P} <: LatentDynamics
+    cfg::ModelConfig
+    params::P
+    g_pad::Vector{Float64}
+end
+
+ModelADynamicsFlat(cfg::ModelConfig, params::ModelAParamsFull) =
+    ModelADynamicsFlat{ModelAParamsFull}(cfg, params,
+                                         _pad_pmf(cfg.generation_interval,
+                                                  buffer_len(cfg)))
+
+function SSMProblems.simulate(rng::AbstractRNG, dyn::ModelADynamicsFlat,
+                              step::Integer, state::AbstractVector; kwargs...)
+    cfg = dyn.cfg
+    L = buffer_len(cfg)
+    log_Rt      = state[1]
+    log_sigma_R = state[2]
+    log_F       = state[3]
+    log_sigma_F = state[4]
+    I_buf       = @view state[5:end]
+
+    sigma_R = _floor_sigma(log_sigma_R, cfg.sigma_floor)
+    sigma_F = _floor_sigma(log_sigma_F, cfg.sigma_floor)
+    tau_R   = _floor_sigma(dyn.params.log_tau_R, cfg.sigma_floor)
+    tau_F   = _floor_sigma(dyn.params.log_tau_F, cfg.sigma_floor)
+
+    eps_R = randn(rng); eta_R = randn(rng)
+    eps_F = randn(rng); eta_F = randn(rng)
+
+    log_Rt_new      = log_Rt      + sigma_R * eps_R
+    log_F_new       = log_F       + sigma_F * eps_F
+    log_sigma_R_new = log_sigma_R + tau_R   * eta_R
+    log_sigma_F_new = log_sigma_F + tau_F   * eta_F
+
+    g_conv_I = dot(dyn.g_pad, I_buf)
+    F_new = exp(log_F_new)
+    log_Rt_clipped = clamp(log_Rt_new, -20.0, 20.0)
+    exponent = clamp(log_Rt_clipped - F_new * g_conv_I, -20.0, 20.0)
+    Rt_eff = exp(exponent)
+    I_new = min(Rt_eff * g_conv_I, 1e15)
+
+    new = similar(state)
+    new[1] = log_Rt_new
+    new[2] = log_sigma_R_new
+    new[3] = log_F_new
+    new[4] = log_sigma_F_new
+    new[5] = I_new
+    @views new[6:end] .= I_buf[1:end-1]
+    return new
+end
+
+struct ModelAObservationFlat{P} <: ObservationProcess
+    cfg::ModelConfig
+    params::P
+    d_pad::Vector{Float64}
+end
+
+ModelAObservationFlat(cfg::ModelConfig, params::ModelAParamsFull) =
+    ModelAObservationFlat{ModelAParamsFull}(cfg, params,
+                                            _pad_pmf(cfg.delay_pmf,
+                                                     buffer_len(cfg)))
+
+function SSMProblems.distribution(obs::ModelAObservationFlat, step::Integer,
+                                  state::AbstractVector; kwargs...)
+    I_buf = @view state[5:end]
+    mu_t = dot(obs.d_pad, I_buf)
+    return negbin2(mu_t, exp(obs.params.log_phi))
+end
+
+function build_ssm_flat(cfg::ModelConfig, params::ModelAParamsFull)
+    return StateSpaceModel(
+        ModelAPriorFlat(cfg, params.log_I0),
+        ModelADynamicsFlat(cfg, params),
+        ModelAObservationFlat(cfg, params),
+    )
 end
 
 end # module

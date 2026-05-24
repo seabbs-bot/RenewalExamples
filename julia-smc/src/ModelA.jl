@@ -1,16 +1,20 @@
 module ModelA
 
 using Distributions
+using GeneralisedFilters
 using LinearAlgebra: I, dot
-using LogExpFunctions: logaddexp
+using LogExpFunctions: logaddexp, logsumexp
 using Random
 using SpecialFunctions: loggamma
+using SSMProblems
 using StatsFuns: normlogpdf
-using Turing
+
+const GF = GeneralisedFilters
 
 export ModelConfig, default_config, discretised_gamma,
-       SyntheticDataset, simulate, step_state,
-       model_a, model_a_logRt_trajectory
+       SyntheticDataset, simulate, step_state, sample_initial_state,
+       expected_observation, negbin2, buffer_len,
+       ModelAParams, build_ssm, pf_marginal_loglik
 
 Base.@kwdef struct ModelConfig
     generation_interval::Vector{Float64}
@@ -46,13 +50,8 @@ function discretised_gamma(shape::Real, scale::Real, support::AbstractVector{<:I
     return dens ./ sum(dens)
 end
 
-function default_generation_interval(; max_lag::Int = 14)
-    return discretised_gamma(3.0, 1.5, 1:max_lag)
-end
-
-function default_delay_pmf(; max_lag::Int = 14)
-    return discretised_gamma(2.5, 2.5, 1:max_lag)
-end
+default_generation_interval(; max_lag::Int = 14) = discretised_gamma(3.0, 1.5, 1:max_lag)
+default_delay_pmf(; max_lag::Int = 14) = discretised_gamma(2.5, 2.5, 1:max_lag)
 
 function default_config()
     return ModelConfig(
@@ -69,8 +68,6 @@ end
 
 _floor_sigma(log_sigma, floor) = max(exp(log_sigma), floor)
 
-# One step of the nested-RW renewal model. Returns updated state as a
-# named tuple. `I_buf[1]` is the most recent infection (= I(t-1)).
 function step_state(state, log_tau_R, log_tau_F, noise, cfg::ModelConfig,
                     g_pad::AbstractVector)
     sigma_R_old = _floor_sigma(state.log_sigma_R, cfg.sigma_floor)
@@ -105,6 +102,12 @@ function expected_observation(I_buf::AbstractVector, cfg::ModelConfig,
     return dot(d_pad, I_buf)
 end
 
+function negbin2(mu, phi)
+    mu_safe = max(mu, 1e-10)
+    p = phi / (mu_safe + phi)
+    return NegativeBinomial(phi, p; check_args = false)
+end
+
 struct SyntheticDataset
     log_tau_R::Float64
     log_tau_F::Float64
@@ -132,16 +135,6 @@ function sample_initial_state(rng::AbstractRNG, cfg::ModelConfig)
     return (log_Rt = log_Rt, log_sigma_R = log_sigma_R,
             log_F = log_F, log_sigma_F = log_sigma_F,
             log_I0 = log_I0, I_buf = I_buf)
-end
-
-# NegBin parameterisation: Distributions.NegativeBinomial(r, p) has mean
-# r * (1 - p) / p. Setting r = phi, p = phi / (mu + phi) gives mean = mu
-# and overdispersion controlled by phi (= NumPyro's NegativeBinomial2 with
-# concentration = phi).
-function negbin2(mu, phi)
-    mu_safe = max(mu, 1e-10)
-    p = phi / (mu_safe + phi)
-    return NegativeBinomial(phi, p; check_args = false)
 end
 
 function simulate(rng::AbstractRNG, cfg::ModelConfig, T::Int;
@@ -183,61 +176,70 @@ function simulate(rng::AbstractRNG, cfg::ModelConfig, T::Int;
                             infections, mu_y, y, state)
 end
 
-# Non-centred Turing model. Innovations eps_R, eta_R, eps_F, eta_F are
-# standard-normal, mirroring the synthetic simulator. Initial state and
-# top-level (log_tau_R, log_tau_F, log_phi) get priors matching the config.
-@model function model_a(y::AbstractVector, cfg::ModelConfig)
-    T = length(y)
-    L = buffer_len(cfg)
-    g_pad = _pad_pmf(cfg.generation_interval, L)
-    d_pad = _pad_pmf(cfg.delay_pmf, L)
+# --- SSMProblems / GeneralisedFilters integration ---
 
-    log_tau_R ~ Normal(cfg.prior_log_tau_R_mean, cfg.prior_log_tau_R_sd)
-    log_tau_F ~ Normal(cfg.prior_log_tau_F_mean, cfg.prior_log_tau_F_sd)
-    log_phi ~ Normal(cfg.prior_log_phi_mean, cfg.prior_log_phi_sd)
-
-    log_Rt0 ~ Normal(cfg.init_log_Rt_mean, cfg.init_log_Rt_sd)
-    log_sigma_R0 ~ Normal(cfg.init_log_sigma_R_mean, cfg.init_log_sigma_R_sd)
-    log_F0 ~ Normal(cfg.init_log_F_mean, cfg.init_log_F_sd)
-    log_sigma_F0 ~ Normal(cfg.init_log_sigma_F_mean, cfg.init_log_sigma_F_sd)
-    log_I0 ~ Normal(cfg.init_log_I0_mean, cfg.init_log_I0_sd)
-
-    eps_R ~ MvNormal(zeros(T), I)
-    eta_R ~ MvNormal(zeros(T), I)
-    eps_F ~ MvNormal(zeros(T), I)
-    eta_F ~ MvNormal(zeros(T), I)
-
-    phi = exp(log_phi)
-    state = (log_Rt = log_Rt0, log_sigma_R = log_sigma_R0,
-             log_F = log_F0, log_sigma_F = log_sigma_F0,
-             log_I0 = log_I0, I_buf = fill(exp(log_I0), L))
-
-    for t in 1:T
-        noise = (eps_R = eps_R[t], eta_R = eta_R[t],
-                 eps_F = eps_F[t], eta_F = eta_F[t])
-        state = step_state(state, log_tau_R, log_tau_F, noise, cfg, g_pad)
-        mu_t = expected_observation(state.I_buf, cfg, d_pad)
-        y[t] ~ negbin2(mu_t, phi)
-    end
+struct ModelAParams
+    log_tau_R::Float64
+    log_tau_F::Float64
+    log_phi::Float64
 end
 
-# Helper to reconstruct log_Rt(t) for any posterior draw given the model
-# arguments. Used for filter / smoother bands in the fit script.
-function model_a_logRt_trajectory(draw, cfg::ModelConfig, T::Int)
-    L = buffer_len(cfg)
-    g_pad = _pad_pmf(cfg.generation_interval, L)
-    state = (log_Rt = draw.log_Rt0, log_sigma_R = draw.log_sigma_R0,
-             log_F = draw.log_F0, log_sigma_F = draw.log_sigma_F0,
-             log_I0 = draw.log_I0, I_buf = fill(exp(draw.log_I0), L))
-    out = Vector{Float64}(undef, T)
-    for t in 1:T
-        noise = (eps_R = draw.eps_R[t], eta_R = draw.eta_R[t],
-                 eps_F = draw.eps_F[t], eta_F = draw.eta_F[t])
-        state = step_state(state, draw.log_tau_R, draw.log_tau_F,
-                           noise, cfg, g_pad)
-        out[t] = state.log_Rt
-    end
-    return out
+struct ModelAPrior <: StatePrior
+    cfg::ModelConfig
+end
+
+# We define `simulate` directly rather than `distribution` because the initial
+# state mixes continuous scalars with a deterministically-derived buffer.
+function SSMProblems.simulate(rng::AbstractRNG, prior::ModelAPrior; kwargs...)
+    return sample_initial_state(rng, prior.cfg)
+end
+
+struct ModelADynamics{P} <: LatentDynamics
+    cfg::ModelConfig
+    params::P
+    g_pad::Vector{Float64}
+end
+
+ModelADynamics(cfg::ModelConfig, params::ModelAParams) =
+    ModelADynamics{ModelAParams}(cfg, params, _pad_pmf(cfg.generation_interval, buffer_len(cfg)))
+
+function SSMProblems.simulate(rng::AbstractRNG, dyn::ModelADynamics,
+                              step::Integer, state; kwargs...)
+    noise = (eps_R = randn(rng), eta_R = randn(rng),
+             eps_F = randn(rng), eta_F = randn(rng))
+    return step_state(state, dyn.params.log_tau_R, dyn.params.log_tau_F,
+                      noise, dyn.cfg, dyn.g_pad)
+end
+
+struct ModelAObservation{P} <: ObservationProcess
+    cfg::ModelConfig
+    params::P
+    d_pad::Vector{Float64}
+end
+
+ModelAObservation(cfg::ModelConfig, params::ModelAParams) =
+    ModelAObservation{ModelAParams}(cfg, params, _pad_pmf(cfg.delay_pmf, buffer_len(cfg)))
+
+function SSMProblems.distribution(obs::ModelAObservation, step::Integer, state;
+                                  kwargs...)
+    mu_t = expected_observation(state.I_buf, obs.cfg, obs.d_pad)
+    return negbin2(mu_t, exp(obs.params.log_phi))
+end
+
+function build_ssm(cfg::ModelConfig, params::ModelAParams)
+    return StateSpaceModel(
+        ModelAPrior(cfg),
+        ModelADynamics(cfg, params),
+        ModelAObservation(cfg, params),
+    )
+end
+
+function pf_marginal_loglik(rng::AbstractRNG, cfg::ModelConfig,
+                            params::ModelAParams, y::AbstractVector;
+                            n_particles::Int = 2000)
+    model = build_ssm(cfg, params)
+    _, ll = GF.filter(rng, model, GF.BF(n_particles), y)
+    return ll
 end
 
 end # module

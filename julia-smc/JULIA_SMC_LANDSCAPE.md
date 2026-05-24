@@ -43,14 +43,14 @@ Reasoning:
   In practice the long latent path also degenerates PG on this scale (T ≈ 120, ~480 latent innovations), so the gain over NUTS is not obvious.
 - `LowLevelParticleFilters.jl` and `ParticleFilters.jl` ship a bootstrap PF and resampling but assume a known dynamics object with static parameters — no built-in cloud over `(log_tau_R, log_tau_F, log_phi)` and no Liu-West jittering.
 
-Result on the synthetic data with `T=120`, NUTS warmup 300 + 300 samples, `InitFromPrior()`:
+Result on the synthetic data with `T = 120`, NUTS warmup 300 + 300 samples, `InitFromPrior()` (reproducible with `MersenneTwister(11)` in `scripts/02_fit.jl`):
 
-- `log_tau_R` = -4.04 ± 0.31 (truth -4.0)
-- `log_tau_F` = -12.00 ± 0.53 (truth -12.0)
-- `log_phi`   =  2.51 ± 0.14 (truth +2.5)
+- `log_tau_R` = -4.024 ± 0.267 (truth -4.0)
+- `log_tau_F` = -11.982 ± 0.561 (truth -12.0)
+- `log_phi`   =  2.516 ± 0.129 (truth +2.5)
 
 All three within ~1.5% of truth, comparable to the `~5%` recovery the JAX Liu-West PF reports for the same parameters in `smc-jax/README.md`.
-The smoothed log_Rt(t) posterior band tracks the ground-truth trajectory closely with ~90% empirical coverage.
+The smoothed log_Rt(t) posterior band achieves 89.2% empirical coverage of the truth trajectory (nominal 90%).
 
 Initialisation matters: `InitFromUniform()` (the Turing default) starts at log_F values that make the feedback term blow up the gradient on the first step and adapts the step size to ~1e-8.
 `InitFromPrior()` starts in a well-conditioned region and adapts to a sensible step.

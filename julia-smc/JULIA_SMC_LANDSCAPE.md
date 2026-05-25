@@ -1,18 +1,24 @@
 # Julia SMC landscape vs `smc-jax`
 
-What is in `julia-smc/` is three SMC-flavoured fits of Model A on the same synthetic dataset, built on the Julia SMC ecosystem (GeneralisedFilters.jl, SSMProblems.jl, AdvancedPS / Turing, a small hand-rolled SMC sampler).
+What is in `julia-smc/` is six SMC-flavoured fits of Model A on the same synthetic dataset, built on the Julia SMC ecosystem (GeneralisedFilters.jl, SSMProblems.jl, AdvancedPS / Turing, LowLevelParticleFilters.jl, a small hand-rolled SMC sampler).
 The point is to see what stock Julia tooling gives you on Model A and where you still have to write code or work around structural limits.
+The three GenFilters-based variants (`pmmh/`, `smc2/`, `pgas_nuts/`) are paired with three LLPF-based duplicates (`llpf_pmmh/`, `llpf_smc2/`, `llpf_ukf_nuts/`) so the inference engines can be compared like-for-like on identical synthetic data.
 
 An earlier round used Turing + NUTS over the joint posterior of (theta, latent innovations).
 That works fine and is a well-known Julia approach, so it is dropped here in favour of three actual SMC variants.
 
-## Three variants in this directory
+## Six variants in this directory
 
-| Variant | Outer (theta) | Inner (latent path) | Marginal for theta | Uses `src/ModelA.jl` SSMProblems wrappers? |
+| Variant | Outer (theta) | Inner (latent path) | PF package | Uses `ModelA.jl` SSMProblems wrappers? |
 | --- | --- | --- | --- | --- |
-| `pmmh/` | Metropolis-Hastings (manual loop, AdvancedMH-style) | Bootstrap PF, GeneralisedFilters.jl `BF` | PF marginal log-lik (noisy, unbiased) | **Yes** — via `build_ssm` → `StateSpaceModel(prior, dyn, obs)` → `BF` |
-| `smc2/` | SMC sampler with adaptive tempering (hand-rolled, ~150 LOC) | Bootstrap PF, GeneralisedFilters.jl `BF` | same PF marginal, called per theta-particle | **Yes** — same path |
-| `pgas_nuts/` | NUTS (Turing) | Particle Gibbs (Turing / AdvancedPS bootstrap PF) | Gibbs(PG, NUTS) alternates updates rather than computing an explicit marginal | **No** — Turing's `Gibbs(PG, NUTS)` requires latents declared inline in the `@model`. Calls `ModelA.step_state` for the renewal step so the dynamics live in one place, but does not feed through `build_ssm`. |
+| `pmmh/` | Metropolis-Hastings (manual loop) | Bootstrap PF | **GeneralisedFilters** `BF` | **Yes** — via `build_ssm` |
+| `smc2/` | adaptive-tempered SMC sampler (hand-rolled) | Bootstrap PF | **GeneralisedFilters** `BF` | **Yes** — via `build_ssm` |
+| `pgas_nuts/` | NUTS (Turing) | Particle Gibbs | **AdvancedPS** (via Turing) | **No** — Turing PG needs inline latents, but calls `ModelA.step_state` for the renewal step |
+| `llpf_pmmh/` | Metropolis-Hastings (manual loop) | Bootstrap PF | **LowLevelParticleFilters** `AdvancedParticleFilter` | partial — uses `ModelAParamsFull` and `llpf_*` helpers |
+| `llpf_smc2/` | adaptive-tempered SMC sampler (hand-rolled) | Bootstrap PF | **LowLevelParticleFilters** `AdvancedParticleFilter` | partial — same helpers |
+| `llpf_ukf_nuts/` | Metropolis-Hastings (NUTS blocked, see below) | Unscented Kalman | **LowLevelParticleFilters** UKF (augmented form) | self-contained UKF wiring in the script |
+
+The LLPF variants extend theta to 4 dimensions because LLPF's initial distribution is a fixed-form `MvNormal` (no per-particle latent initial-state draw the way `sample_initial_state` provides in the GenFilters path), so `log_I0` is sampled explicitly alongside the three target hyperparameters.
 
 All three share `src/ModelA.jl`, which exposes the model in two forms.
 
@@ -36,14 +42,19 @@ All three share `src/ModelA.jl`, which exposes the model in two forms.
 
 Same synthetic dataset throughout: `T = 120`, `MersenneTwister(2)`, truth `(log_tau_R = -4.0, log_tau_F = -12.0, log_phi = 2.5)`.
 
-| Variant | log_tau_R (truth -4.0) | log_tau_F (truth -12.0) | log_phi (truth 2.5) | Notes |
-| --- | --- | --- | --- | --- |
-| `pmmh/` | -4.073 ± 0.301 | -12.042 ± 0.419 | 2.477 ± 0.143 | 1500 iter, 1500 PF particles, accept 0.589 |
-| `smc2/` | -4.099 ± 0.304 | -12.117 ± 0.507 | 2.514 ± 0.148 | 128 theta-particles, 600 PF particles, 4 adaptive-tempering steps |
-| `pgas_nuts/` | -4.145 ± 0.253 | -11.537 ± 0.369 | 2.456 ± 0.147 | 600 iter (150 NUTS adapts), 200 PG particles |
+| Variant | log_tau_R (truth -4.0) | log_tau_F (truth -12.0) | log_phi (truth 2.5) | log_I0 (truth ~1.95) | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `pmmh/` | -4.073 ± 0.301 | -12.042 ± 0.419 | 2.477 ± 0.143 | (marginalised) | 1500 iter, 1500 PF particles, accept 0.589 |
+| `smc2/` | -4.099 ± 0.304 | -12.117 ± 0.507 | 2.514 ± 0.148 | (marginalised) | 128 theta-particles, 600 PF particles, 4 adaptive-tempering steps |
+| `pgas_nuts/` | -4.145 ± 0.253 | -11.537 ± 0.369 | 2.456 ± 0.147 | (sampled as initial state by NUTS) | 600 iter (150 NUTS adapts), 200 PG particles |
+| `llpf_pmmh/` | -4.075 ± 0.288 | -11.967 ± 0.371 | 2.471 ± 0.130 | 2.030 ± 0.157 | 1500 iter, 1500 LLPF AdvancedPF particles, accept 0.525 |
+| `llpf_smc2/` | -4.130 ± 0.283 | -12.030 ± 0.447 | 2.527 ± 0.128 | 1.983 ± 0.170 | 128 theta-particles, 600 LLPF AdvancedPF particles, 4 adaptive-tempering steps |
+| `llpf_ukf_nuts/` | -4.058 ± 0.323 (sd/prior 1.08) | -12.023 ± 0.522 (sd/prior 1.04) | 2.383 ± 0.142 (sd/prior 0.28) | 1.908 ± 0.145 (sd/prior 0.15) | UKF + MH on theta, 4000 iter, accept 0.454. **Tau posteriors prior-stuck; log_phi and log_I0 identified** — empirically reproduces the smc-jax-documented blind spot |
 
-All three recover the parameters to within ~4% of truth on this synthetic data, comparable to what `smc-jax`'s Liu-West PF reports for the same parameters in its README.
-`pgas_nuts` shows slightly larger bias on `log_tau_R` and `log_tau_F` (~3.5-4%), consistent with the known PG mixing penalty on long continuous latent paths.
+All five PF-inner variants recover the parameters to within ~4% of truth on this synthetic data, comparable to what `smc-jax`'s Liu-West PF reports for the same parameters in its README.
+The GenFilters and LLPF variants agree closely with each other where they share the same outer (PMMH vs PMMH, SMC vs SMC) — the choice of PF package is not the bottleneck on Model A.
+
+`pgas_nuts` shows slightly larger bias on `log_tau_F` (~3.5-4%), consistent with the known PG mixing penalty on long continuous latent paths.
 
 ## GenFilters v0.5 PGAS: why it stops short on Model A
 
@@ -103,15 +114,31 @@ The flat-vector wrappers in `src/ModelA.jl` are kept for completeness — they a
    `pfjax.particle_smooth` gives backward-traced sample paths from the surviving genealogy.
    GeneralisedFilters has callbacks that capture the genealogy (`AncestorCallback`) and a `get_ancestry` helper that reconstructs paths after the fact — usable, but thinner than what `smc-jax` builds on.
 
-## The Gaussian-filter blind spot is structural
+## The Gaussian-filter blind spot is structural — and now empirically demonstrated
 
 `smc-jax/README.md` documents that SMC² + EKF / UKF is essentially blind to `(log_tau_R, log_tau_F)`.
 The linearisation collapses the chain `tau → variance of log sigma → sigma via exp`, so the marginal log-lik moves with `log_phi` but barely with the tau parameters.
 
-This is independent of language.
-A Julia UKF inner SMC² (LowLevelParticleFilters UKF + a hand-rolled SMC over theta) would land on the same blind spot.
-The fix is to keep the inner exact, which means a particle filter — bootstrap or guided.
-That is why both `pmmh/` and `smc2/` here use a PF inner, and why no UKF-inner-with-NUTS-on-theta variant is provided.
+`llpf_ukf_nuts/` reproduces this empirically in Julia.
+With a LLPF UKF (augmented form to handle the multiplicative noise) supplying the marginal log-likelihood and MH sampling theta, after 4000 iterations:
+
+- `log_tau_R` posterior sd 0.323 vs prior sd 0.3 — ratio 1.08, posterior is the prior
+- `log_tau_F` posterior sd 0.522 vs prior sd 0.5 — ratio 1.04, posterior is the prior
+- `log_phi` posterior sd 0.142 vs prior sd 0.5 — ratio 0.28, sharply identified
+- `log_I0` posterior sd 0.145 vs prior sd 1.0 — ratio 0.15, sharply identified
+
+This is independent of language and inference engine — Julia UKF gives the same blind spot the smc-jax SMC² + EKF docs describe.
+The fix is to keep the inner exact, which means a particle filter (bootstrap or guided).
+That is why both `pmmh/` and `smc2/` (and their LLPF duplicates) use a PF inner.
+
+## NUTS-on-theta with the UKF marginal: blocked by an AD-trace cast
+
+The original target for `llpf_ukf_nuts/` was NUTS-on-theta with the UKF marginal as the log-likelihood (i.e. the smc-jax SMC² + EKF design but with NUTS on theta instead of an outer SMC).
+LLPF's UKF implementation contains a `Float64(::ForwardDiff.Dual)` cast in its Cholesky path, which throws on ForwardDiff tracing — so the UKF marginal is not directly differentiable through ForwardDiff (Turing's default AD).
+Switching the AD backend to ReverseDiff hits the same cast.
+The current script uses Metropolis-Hastings on theta instead.
+
+This is an LLPF implementation detail, not a fundamental limit — a UKF variant that avoids the `Float64` cast (or a switch to a UKF written in pure ForwardDiff-compatible code) would let NUTS handle theta on the UKF marginal.
 
 ## Reproducing
 

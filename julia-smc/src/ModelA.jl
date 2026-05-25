@@ -5,10 +5,13 @@ using GeneralisedFilters
 import LinearAlgebra
 using LinearAlgebra: I, dot
 using LogExpFunctions: logaddexp, logsumexp
+using LowLevelParticleFilters: LowLevelParticleFilters
 using Random
 using SpecialFunctions: loggamma
 using SSMProblems
 using StatsFuns: normlogpdf
+
+const LLPF = LowLevelParticleFilters
 
 const GF = GeneralisedFilters
 
@@ -17,7 +20,9 @@ export ModelConfig, default_config, discretised_gamma,
        expected_observation, negbin2, buffer_len,
        ModelAParams, build_ssm, pf_marginal_loglik,
        ModelAParamsFull, ModelAPriorFlat, ModelADynamicsFlat,
-       ModelAObservationFlat, build_ssm_flat
+       ModelAObservationFlat, build_ssm_flat,
+       llpf_dynamics_fn, llpf_measurement_likelihood_fn,
+       llpf_initial_dist, llpf_dummy_measurement, llpf_marginal_loglik
 
 Base.@kwdef struct ModelConfig
     generation_interval::Vector{Float64}
@@ -375,6 +380,91 @@ function build_ssm_flat(cfg::ModelConfig, params::ModelAParamsFull)
         ModelADynamicsFlat(cfg, params),
         ModelAObservationFlat(cfg, params),
     )
+end
+
+# --- LowLevelParticleFilters wiring ---
+#
+# AdvancedParticleFilter handles non-additive (multiplicative) dynamics
+# noise, which is what Model A's nested-RW structure needs. Reuses the
+# same flat-Vector state as the GenFilters wrappers.
+
+function llpf_dynamics_fn(cfg::ModelConfig, params::ModelAParamsFull)
+    L = buffer_len(cfg)
+    g_pad = _pad_pmf(cfg.generation_interval, L)
+    tau_R = _floor_sigma(params.log_tau_R, cfg.sigma_floor)
+    tau_F = _floor_sigma(params.log_tau_F, cfg.sigma_floor)
+    function dyn(x, u, p, t, noise = false)
+        sigma_R = _floor_sigma(x[2], cfg.sigma_floor)
+        sigma_F = _floor_sigma(x[4], cfg.sigma_floor)
+        eps_R = randn(); eta_R = randn()
+        eps_F = randn(); eta_F = randn()
+        log_Rt_new      = x[1] + sigma_R * eps_R
+        log_sigma_R_new = x[2] + tau_R   * eta_R
+        log_F_new       = x[3] + sigma_F * eps_F
+        log_sigma_F_new = x[4] + tau_F   * eta_F
+        g_conv_I = @views dot(g_pad, x[5:end])
+        F_new = exp(log_F_new)
+        log_Rt_clipped = clamp(log_Rt_new, -20.0, 20.0)
+        exponent = clamp(log_Rt_clipped - F_new * g_conv_I, -20.0, 20.0)
+        Rt_eff = exp(exponent)
+        I_new = min(Rt_eff * g_conv_I, 1e15)
+        out = similar(x)
+        out[1] = log_Rt_new
+        out[2] = log_sigma_R_new
+        out[3] = log_F_new
+        out[4] = log_sigma_F_new
+        out[5] = I_new
+        @views out[6:end] .= x[5:end-1]
+        return out
+    end
+    return dyn
+end
+
+function llpf_measurement_likelihood_fn(cfg::ModelConfig,
+                                        params::ModelAParamsFull)
+    L = buffer_len(cfg)
+    d_pad = _pad_pmf(cfg.delay_pmf, L)
+    phi = exp(params.log_phi)
+    function mll(x, u, y, p, t)
+        I_buf = @view x[5:end]
+        mu_t = dot(d_pad, I_buf)
+        return logpdf(negbin2(mu_t, phi), y[1])
+    end
+    return mll
+end
+
+function llpf_initial_dist(cfg::ModelConfig, params::ModelAParamsFull)
+    L = buffer_len(cfg)
+    I0 = exp(params.log_I0)
+    means = vcat(
+        [cfg.init_log_Rt_mean, cfg.init_log_sigma_R_mean,
+         cfg.init_log_F_mean,  cfg.init_log_sigma_F_mean],
+        fill(I0, L),
+    )
+    vars = vcat(
+        [cfg.init_log_Rt_sd^2, cfg.init_log_sigma_R_sd^2,
+         cfg.init_log_F_sd^2,  cfg.init_log_sigma_F_sd^2],
+        fill(1e-16, L),
+    )
+    return Distributions.MvNormal(means, LinearAlgebra.Diagonal(vars))
+end
+
+function llpf_dummy_measurement(x, u, p, t, noise = false)
+    return [0.0]
+end
+
+function llpf_marginal_loglik(cfg::ModelConfig, params::ModelAParamsFull,
+                              y::AbstractVector; n_particles::Int = 1500)
+    dyn = llpf_dynamics_fn(cfg, params)
+    mll = llpf_measurement_likelihood_fn(cfg, params)
+    d0  = llpf_initial_dist(cfg, params)
+    pf  = LLPF.AdvancedParticleFilter(n_particles, dyn, llpf_dummy_measurement,
+                                       mll, nothing, d0)
+    T = length(y)
+    u_dummy = [Float64[] for _ in 1:T]
+    y_vec   = [[Float64(yt)] for yt in y]
+    sol = LLPF.forward_trajectory(pf, u_dummy, y_vec)
+    return sol.ll
 end
 
 end # module

@@ -131,14 +131,18 @@ This is independent of language and inference engine — Julia UKF gives the sam
 The fix is to keep the inner exact, which means a particle filter (bootstrap or guided).
 That is why both `pmmh/` and `smc2/` (and their LLPF duplicates) use a PF inner.
 
-## NUTS-on-theta with the UKF marginal: blocked by an AD-trace cast
+## NUTS-on-theta with the UKF marginal: blocked across all three AD backends
 
 The original target for `llpf_ukf_nuts/` was NUTS-on-theta with the UKF marginal as the log-likelihood (i.e. the smc-jax SMC² + EKF design but with NUTS on theta instead of an outer SMC).
-LLPF's UKF implementation contains a `Float64(::ForwardDiff.Dual)` cast in its Cholesky path, which throws on ForwardDiff tracing — so the UKF marginal is not directly differentiable through ForwardDiff (Turing's default AD).
-Switching the AD backend to ReverseDiff hits the same cast.
-The current script uses Metropolis-Hastings on theta instead.
+We tried all three of Turing's AD backends and each fails on the LLPF UKF:
 
-This is an LLPF implementation detail, not a fundamental limit — a UKF variant that avoids the `Float64` cast (or a switch to a UKF written in pure ForwardDiff-compatible code) would let NUTS handle theta on the UKF marginal.
+- **ForwardDiff**: `MethodError: no method matching Float64(::ForwardDiff.Dual{...})` — a `Float64(...)` cast in LLPF's UKF Cholesky / SimpleMvNormal path does not accept Duals.
+- **ReverseDiff** (`AutoReverseDiff(compile=false)`): `ArgumentError: Converting an instance of ReverseDiff.TrackedReal{...} to Float64 is not defined. Please use ReverseDiff.value instead.` — same cast.
+- **Mooncake** (`AutoMooncake(config=nothing)`): `AD has hit a :(jl_get_tls_world_age) ccall. This should not happen.` — a dynamic-dispatch ccall inside the LLPF UKF that Mooncake cannot trace.
+
+This is an LLPF implementation detail, not a fundamental limit.
+The `Float64(...)` cast (or the world-age-sensitive call hit by Mooncake) would need to be replaced by an AD-friendly equivalent inside LLPF before any of the AD backends could carry NUTS through the UKF marginal.
+The current `llpf_ukf_nuts/` script uses Metropolis-Hastings on theta instead.
 
 ## Reproducing
 

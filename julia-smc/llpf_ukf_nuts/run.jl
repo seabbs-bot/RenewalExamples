@@ -19,10 +19,14 @@ const LLPF = LowLevelParticleFilters
 # marginal moves with `log_phi` but barely with the tau parameters.
 #
 # NUTS was the original target ("NUTS for static params"). LLPF's UKF
-# implementation contains a `Float64(::ForwardDiff.Dual)` cast (in the
-# Cholesky path) that blocks ForwardDiff tracing, so the marginal is
-# not directly differentiable. MH on theta avoids the AD requirement
-# and demonstrates the same blind-spot finding.
+# implementation has a `Float64(...)` cast in the Cholesky / SimpleMvNormal
+# path that blocks all three Julia AD backends we tried:
+#   - ForwardDiff:  MethodError: no method matching Float64(::Dual{...})
+#   - ReverseDiff:  Converting TrackedReal to Float64 is not defined
+#   - Mooncake:     AD has hit a :(jl_get_tls_world_age) ccall
+# So the UKF marginal is not directly differentiable through Turing's
+# usual paths. MH on theta avoids the AD requirement and demonstrates
+# the same blind-spot finding.
 #
 # State layout matches build_ssm_flat: length 4 + L = 18,
 # [log_Rt, log_sigma_R, log_F, log_sigma_F, I_buf...]. Measurement is
